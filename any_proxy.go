@@ -75,6 +75,7 @@ var (
   gVerbosity int
   gXFF int
   gTLSSkip int
+  gALLSSL int
   gSkipCheckUpstreamsReachable int
   gProxyServers []proxySpec
   gAuthProxyServers = map[string] string { }
@@ -218,6 +219,7 @@ func init() {
     flag.StringVar(&gStatsFile, "stat", gStatsFile,  "Path to a file, where stats will be written.\n")
     flag.IntVar(   &gXFF,       "x", 1,  "X-Forwarded-For header. x=0 will disable the header.\n")
     flag.IntVar(   &gTLSSkip,       "sk", 0,  "InsecureSkipVerify. sk=1 will bypass ssl errors in proxy connection.\n")
+    flag.IntVar(   &gALLSSL,       "allssl", 0,  "allssl=1 will use TLS to connect to proxy, non TLS connections will not work.\n")
     flag.IntVar(   &gVerbosity,       "v", 0,  "Control level of logging. v=1 results in debugging info printed to the log.\n")
 
     dirFuncs := buildDirectors(gDirects)
@@ -561,6 +563,15 @@ func getOriginalDst(clientConn *net.TCPConn) (ipv4 string, port uint16, newTCPCo
     return
 }
 
+func dialTLS(spec proxySpec) (*tls.Conn, error) {
+	conn, err := tls.Dial("tcp", spec.host + ":" + spec.portString, &spec.tlsConfig)
+	if err != nil {
+		log.Infof("dialTLS(): ERR: could not connect to %v:%v: %v", spec.host, spec.portString, err)
+	}
+
+	return conn, err
+}
+
 func dial(spec proxySpec) (*net.TCPConn, error) {
 	remoteAddr, err := net.ResolveIPAddr("ip", spec.host)
 
@@ -618,6 +629,127 @@ func handleDirectConnection(clientConn *net.TCPConn, ipv4 string, port uint16) {
     go copy(directConn, clientConn, "directserver", "client")
 }
 
+func handleTLSProxyConnection(clientConn *net.TCPConn, ipv4 string, port uint16) {
+    var proxyConn *tls.Conn
+    var err error
+    var success bool = false
+    var host string
+    var connectHostname string
+    var headerXFF string = ""
+    var handshakeBuf bytes.Buffer
+
+    // TODO: remove
+    log.Debugf("Enter handleTLSProxyConnection: clientConn=%+v (%T)\n", clientConn, clientConn)
+
+    if clientConn == nil {
+        log.Debugf("handleTLSProxyConnection(): oops, clientConn is nil!")
+        return
+    }
+
+    // test if the underlying fd is nil
+    remoteAddr := clientConn.RemoteAddr()
+    if remoteAddr == nil {
+        log.Debugf("handleProxyConnect(): oops, clientConn.fd is nil!")
+        err = errors.New("ERR: clientConn.fd is nil")
+        return
+    }
+
+    if gXFF != 0 {
+        host, _, err = net.SplitHostPort(remoteAddr.String())
+        if err == nil {
+            headerXFF = fmt.Sprintf("X-Forwarded-For: %s\r\n", host)
+        }
+    }
+
+    if gReverseLookups == 1 {
+        hostname := gReverseLookupCache.lookup(ipv4)
+        if hostname != "" {
+            ipv4 = hostname
+        } else {
+            names, err := net.LookupAddr(ipv4)
+            if err == nil && len(names) > 0 {
+                gReverseLookupCache.store(ipv4,names[0])
+                ipv4 = names[0]
+            }
+        }
+    }
+
+    for _, proxySpec := range gProxyServers {
+        if proxySpec.ssl == false {
+            continue
+        }
+        proxyConn, err = dialTLS(proxySpec)
+        if err != nil {
+            log.Debugf("PROXY|%v->%v->%s:%d|Trying next proxy.", clientConn.RemoteAddr(), proxySpec, ipv4, port)
+            continue
+        }
+        log.Debugf("PROXY|%v->%v->%s:%d|Connected to proxy\n", clientConn.RemoteAddr(), proxyConn.RemoteAddr(), ipv4, port)
+        connectHostname = ipv4
+        if gSNIParsing == 1 {
+            host, _, _ = extractSNI(io.TeeReader(clientConn, &handshakeBuf))
+            if len(host) != 0 {
+                connectHostname = host
+            }
+	    log.Debugf("SNI-PARSING|%v via %v for %v on destination %s:%d", clientConn.RemoteAddr(), proxyConn.RemoteAddr(), host, ipv4, port)
+	}
+	var authString = ""
+	if proxySpec.auth != "" {
+	  authString = fmt.Sprintf("\r\nProxy-Authorization: Basic %s", proxySpec.auth)
+	}
+        connectString := fmt.Sprintf("CONNECT %s:%d HTTP/1.0%s\r\n%s\r\n", connectHostname, port, authString, headerXFF)
+        log.Debugf("PROXY|%v->%v->%s:%d|Sending to proxy: %s\n", clientConn.RemoteAddr(), proxyConn.RemoteAddr(), ipv4, port, strconv.Quote(connectString))
+        fmt.Fprintf(proxyConn, connectString)
+        if gSNIParsing == 1 {
+	    // Sending back initial HELLO which we parsed
+            proxyConn.Write(handshakeBuf.Bytes()) 
+        }
+	status, err := bufio.NewReader(proxyConn).ReadString('\n')
+        log.Debugf("PROXY|%v->%v->%s:%d|Received from proxy: %s", clientConn.RemoteAddr(), proxyConn.RemoteAddr(), ipv4, port, strconv.Quote(status))
+        if err != nil {
+            log.Infof("PROXY|%v->%v->%s:%d|ERR: Could not find response to CONNECT: err=%v. Trying next proxy", clientConn.RemoteAddr(), proxyConn.RemoteAddr(), ipv4, port, err)
+            incrProxyNoConnectResponses()
+            continue
+        }
+        if strings.Contains(status, "400") { // bad request
+            log.Debugf("PROXY|%v->%v->%s:%d|Status from proxy=400 (Bad Request)", clientConn.RemoteAddr(), proxyConn.RemoteAddr(), ipv4, port)
+            log.Debugf("%v: Response from proxy=400", proxySpec)
+            incrProxy400Responses()
+            copy(clientConn, proxyConn, "client", "proxyserver")
+            return
+        }
+        if strings.Contains(status, "301") || strings.Contains(status, "302") && gClientRedirects == 1 {
+            log.Debugf("PROXY|%v->%v->%s:%d|Status from proxy=%s (Redirect), relaying response to client", clientConn.RemoteAddr(), proxyConn.RemoteAddr(), ipv4, port, strconv.Quote(status))
+            incrProxy300Responses()
+            fmt.Fprintf(clientConn, status)
+            copy(clientConn, proxyConn, "client", "proxyserver")
+            return
+        }
+        if strings.Contains(status, "200") == false {
+            log.Infof("PROXY|%v->%v->%s:%d|ERR: Proxy response to CONNECT was: %s. Trying next proxy.\n", clientConn.RemoteAddr(), proxyConn.RemoteAddr(), ipv4, port, strconv.Quote(status))
+            incrProxyNon200Responses()
+            continue
+        } else {
+            incrProxy200Responses()
+        }
+        log.Debugf("PROXY|%v->%v->%s:%d|Proxied connection", clientConn.RemoteAddr(), proxyConn.RemoteAddr(), ipv4, port)
+        success = true
+        break
+    }
+    if proxyConn == nil {
+        log.Debugf("handleTLSProxyConnection(): oops, proxyConn is nil!")
+        return
+    }
+    if success == false {
+        log.Infof("PROXY|%v->UNAVAILABLE->%s:%d|ERR: Tried all proxies, but could not establish connection. Giving up.\n", clientConn.RemoteAddr(), ipv4, port)
+        fmt.Fprintf(clientConn, "HTTP/1.0 503 Service Unavailable\r\nServer: go-any-proxy\r\nX-AnyProxy-Error: ERR_NO_PROXIES\r\n\r\n")
+        clientConn.Close()
+        return
+    }
+    incrProxiedConnections()
+    go copy(clientConn, proxyConn, "client", "proxyserver")
+    go copy(proxyConn, clientConn, "proxyserver", "client")
+}
+
 func handleProxyConnection(clientConn *net.TCPConn, ipv4 string, port uint16) {
     var proxyConn net.Conn
     var err error
@@ -664,6 +796,9 @@ func handleProxyConnection(clientConn *net.TCPConn, ipv4 string, port uint16) {
     }
 
     for _, proxySpec := range gProxyServers {
+        if proxySpec.ssl == true {
+            continue
+        }
         proxyConn, err = dial(proxySpec)
         if err != nil {
             log.Debugf("PROXY|%v->%v->%s:%d|Trying next proxy.", clientConn.RemoteAddr(), proxySpec, ipv4, port)
@@ -765,7 +900,11 @@ func handleConnection(clientConn *net.TCPConn) {
             handleDirectConnection(clientConn, ipv4, port)
             return
     }
-    handleProxyConnection(clientConn, ipv4, port)
+    if gALLSSL == 1 {
+	    handleTLSProxyConnection(clientConn, ipv4, port)
+    } else {
+	    handleProxyConnection(clientConn, ipv4, port)
+    }
 }
 
 // from pkg/net/parse.go
