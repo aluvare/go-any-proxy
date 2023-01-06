@@ -75,10 +75,7 @@ var (
   gVerbosity int
   gXFF int
   gTLSSkip int
-<<<<<<< HEAD
   gALLSSL int
-=======
->>>>>>> refs/remotes/origin/master
   gSkipCheckUpstreamsReachable int
   gProxyServers []proxySpec
   gAuthProxyServers = map[string] string { }
@@ -222,10 +219,7 @@ func init() {
     flag.StringVar(&gStatsFile, "stat", gStatsFile,  "Path to a file, where stats will be written.\n")
     flag.IntVar(   &gXFF,       "x", 1,  "X-Forwarded-For header. x=0 will disable the header.\n")
     flag.IntVar(   &gTLSSkip,       "sk", 0,  "InsecureSkipVerify. sk=1 will bypass ssl errors in proxy connection.\n")
-<<<<<<< HEAD
     flag.IntVar(   &gALLSSL,       "allssl", 0,  "allssl=1 will use TLS to connect to proxy, non TLS connections will not work.\n")
-=======
->>>>>>> refs/remotes/origin/master
     flag.IntVar(   &gVerbosity,       "v", 0,  "Control level of logging. v=1 results in debugging info printed to the log.\n")
 
     dirFuncs := buildDirectors(gDirects)
@@ -569,7 +563,6 @@ func getOriginalDst(clientConn *net.TCPConn) (ipv4 string, port uint16, newTCPCo
     return
 }
 
-<<<<<<< HEAD
 func dialTLS(spec proxySpec) (*tls.Conn, error) {
 	conn, err := tls.Dial("tcp", spec.host + ":" + spec.portString, &spec.tlsConfig)
 	if err != nil {
@@ -579,8 +572,6 @@ func dialTLS(spec proxySpec) (*tls.Conn, error) {
 	return conn, err
 }
 
-=======
->>>>>>> refs/remotes/origin/master
 func dial(spec proxySpec) (*net.TCPConn, error) {
 	remoteAddr, err := net.ResolveIPAddr("ip", spec.host)
 
