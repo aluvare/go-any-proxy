@@ -60,6 +60,7 @@ import (
     "syscall"
     "time"
     "encoding/base64"
+    "crypto/tls"
 )
 
 const VERSION = "1.2"
@@ -72,8 +73,10 @@ var (
   gProxyServerSpec string
   gDirects string
   gVerbosity int
+  gXFF int
+  gTLSSkip int
   gSkipCheckUpstreamsReachable int
-  gProxyServers []string
+  gProxyServers []proxySpec
   gAuthProxyServers = map[string] string { }
   gLogfile string
   gCpuProfile string
@@ -87,18 +90,31 @@ type cacheEntry struct {
     hostname string
     expires time.Time
 }
+
 type reverseLookupCache struct {
   hostnames map[string]*cacheEntry
   keys []string
   next int
   mu   sync.Mutex
 }
+
+type proxySpec struct {
+  host string
+  port int
+  portString string
+  ssl bool
+  direct bool
+  auth string
+  tlsConfig tls.Config
+}
+
 func NewReverseLookupCache() *reverseLookupCache {
     return &reverseLookupCache{
         hostnames: make(map[string]*cacheEntry),
         keys: make([]string,65536),
     }
 }
+
 func (c *reverseLookupCache) lookup(ipv4 string) string {
     c.mu.Lock()
     defer c.mu.Unlock()
@@ -132,7 +148,6 @@ var director func(*net.IP) (bool, int)
 func init() {
     dir, _ := filepath.Abs(filepath.Dir(os.Args[0]))
     gConfFile = dir + "/any_proxy.conf"
-    gLogfile = dir + "/any_proxy.log"
     gStatsFile = dir + "/any_proxy.stats"
 
     flag.Usage = func() {
@@ -148,7 +163,7 @@ func init() {
         fmt.Fprintf(os.Stdout, "                   with \"go tool pprof\"\n")
         fmt.Fprintf(os.Stdout, "  -d=DIRECTS       List of IP addresses that the proxy should send to directly instead of\n")
         fmt.Fprintf(os.Stdout, "                   to the upstream proxies (e.g., -d 10.1.1.1,10.1.1.2)\n")
-        fmt.Fprintf(os.Stdout, "  -f=FILE          Log file. If not specified, defaults to %s\n", gLogfile)
+        fmt.Fprintf(os.Stdout, " -f=FILE Log file. If not specified, defaults to STDOUT\n")
         fmt.Fprintf(os.Stdout, "  -h               This usage message\n")
         fmt.Fprintf(os.Stdout, "  -m=FILE          Write a memory profile to FILE. This file can also be interpreted by golang's pprof\n\n")
         fmt.Fprintf(os.Stdout, "  -p=PROXIES       Address and ports of upstream proxy servers to use\n")
@@ -165,7 +180,8 @@ func init() {
         fmt.Fprintf(os.Stdout, "  -s=1             Skip checking if upstream proxy servers are reachable on startup.\n")
         fmt.Fprintf(os.Stdout, "  -S=1             Enable SNI parsing in HTTPS connections and use hostname for CONNECT\n")
         fmt.Fprintf(os.Stdout, "  -stat=1          Path to a file, where to write the stats file. Defaults to %s\n", gStatsFile)
-        fmt.Fprintf(os.Stdout, "  -v=1             Print debug information to logfile %s\n", gLogfile)
+        fmt.Fprintf(os.Stdout, "  -x=0             Disable X-Forwarded-For header\n")
+        fmt.Fprintf(os.Stdout, "  -v=1             Print debug information to logfile\n")
         fmt.Fprintf(os.Stdout, "any_proxy should be able to achieve 2000 connections/sec with logging on, 10k with logging off (-f=/dev/null).\n")
         fmt.Fprintf(os.Stdout, "Before starting any_proxy, be sure to change the number of available file handles to at least 65535\n")
         fmt.Fprintf(os.Stdout, "with \"ulimit -n 65535\"\n")
@@ -200,6 +216,8 @@ func init() {
     flag.IntVar(   &gSNIParsing,      "S", 0,  "Should we parse for SSL hostname while making connections? -S=1 if we should.\n")
     flag.IntVar(   &gSkipCheckUpstreamsReachable, "s", 0,  "On startup, should we check if the upstreams are available? -s=0 means we should and if one is found to be not reachable, then remove it from the upstream list.\n")
     flag.StringVar(&gStatsFile, "stat", gStatsFile,  "Path to a file, where stats will be written.\n")
+    flag.IntVar(   &gXFF,       "x", 1,  "X-Forwarded-For header. x=0 will disable the header.\n")
+    flag.IntVar(   &gTLSSkip,       "sk", 0,  "InsecureSkipVerify. sk=1 will bypass ssl errors in proxy connection.\n")
     flag.IntVar(   &gVerbosity,       "v", 0,  "Control level of logging. v=1 results in debugging info printed to the log.\n")
 
     dirFuncs := buildDirectors(gDirects)
@@ -315,10 +333,11 @@ func setupLogging() {
         log.SetLevel(log.DEBUG)
     }
 
-    fmt.Printf("gLogfile = %s", gLogfile)
+    if gLogfile != "" {
+        if err := log.OpenFile(gLogfile, log.FLOG_APPEND, 0644); err != nil {
+            log.Fatalf("Unable to open log file : %s", err)
+        }
 
-    if err := log.OpenFile(gLogfile, log.FLOG_APPEND, 0644); err != nil {
-        log.Fatalf("Unable to open log file : %s", err)
     }
 }
 
@@ -373,38 +392,71 @@ func main() {
 }
 
 func checkProxies() {
-    gProxyServers = strings.Split(gProxyServerSpec, ",")
-    // make sure proxies resolve and are listening on specified port, unless -s=1, then don't check for reachability
-    for i, proxySpec := range gProxyServers {
-	if strings.Contains(proxySpec, "@") {
-	    var authSplit = strings.Split(proxySpec, "@")
-	    var b64Auth = base64.StdEncoding.EncodeToString([]byte(authSplit[0]))
-	    gAuthProxyServers[authSplit[1]] = b64Auth
-	    proxySpec = authSplit[1]
-	    gProxyServers[i] = proxySpec
-	    log.Infof("Added authentication %v, %v\n", authSplit[0], b64Auth)
+	tmpProxyServers := strings.Split(gProxyServerSpec, ",")
+	// make sure proxies resolve and are listening on specified port, unless -s=1, then don't check for reachability
+	for i, pxSpec := range tmpProxyServers {
+		var tmpSpec proxySpec
+
+		if strings.Contains(pxSpec[:6], "https") {
+			tmpSpec.ssl = true
+			if gTLSSkip == 1 {
+				tmpSpec.tlsConfig = tls.Config{
+					InsecureSkipVerify: true,
+				}
+			} else {
+				tmpSpec.tlsConfig = tls.Config{}
+			}
+		}
+
+		if strings.Contains(pxSpec[:6], "http") {
+			pxSpec = strings.Split(pxSpec, "://")[1]
+		}
+
+		if strings.Contains(pxSpec, "@") {
+			var authSplit = strings.Split(pxSpec, "@")
+			tmpSpec.auth = base64.StdEncoding.EncodeToString([]byte(authSplit[0]))
+
+			pxSpec = authSplit[1]
+
+			log.Infof("Added authentication %v, %v\n", tmpSpec, tmpSpec.auth)
+		}
+
+		host, port, err := net.SplitHostPort(pxSpec)
+		if err != nil {
+			log.Infof("checkProxies(): ERR: could not extract host and port from pxSpec %v: %v", pxSpec, err)
+			return
+		}
+		portInt, err := strconv.Atoi(port)
+		if err != nil {
+			log.Infof("checkProxies(): ERR: could not convert network port from string \"%s\" to integer: %v", port, err)
+			return
+		}
+		tmpSpec.host = host
+		tmpSpec.port = portInt
+		tmpSpec.portString = port
+		gProxyServers = append(gProxyServers, tmpSpec)
+
+		log.Infof("Added proxy server %v\n", pxSpec)
+		if gSkipCheckUpstreamsReachable != 1 {
+			conn, err := dial(tmpSpec)
+			if err != nil {
+				log.Infof("Test connection to %v: failed. Removing from proxy server list\n", tmpSpec)
+				a := gProxyServers[:i]
+				b := gProxyServers[i+1:]
+				gProxyServers = append(a, b...)
+				continue
+			}
+			conn.Close()
+		}
 	}
 
-        log.Infof("Added proxy server %v\n", proxySpec)
-	if gSkipCheckUpstreamsReachable != 1 {
-	    conn, err := dial(proxySpec)
-            if err != nil {
-                log.Infof("Test connection to %v: failed. Removing from proxy server list\n", proxySpec)
-                a := gProxyServers[:i]
-                b := gProxyServers[i+1:]
-                gProxyServers = append(a, b...)
-                continue
-            }
-            conn.Close()
-        }
-    }
-    // do we have at least one proxy server?
-    if len(gProxyServers) == 0 {
-        msg := "None of the proxy servers specified are available. Exiting."
-        log.Infof("%s\n", msg)
-        fmt.Fprintf(os.Stderr, msg)
-        os.Exit(1)
-    }
+	// do we have at least one proxy server?
+	if len(gProxyServers) == 0 {
+		msg := "None of the proxy servers specified are available. Exiting."
+		log.Infof("%s\n", msg)
+		fmt.Fprintf(os.Stderr, msg)
+		os.Exit(1)
+	}
 }
 
 func copy(dst io.ReadWriteCloser, src io.ReadWriteCloser, dstname string, srcname string) {
@@ -509,30 +561,26 @@ func getOriginalDst(clientConn *net.TCPConn) (ipv4 string, port uint16, newTCPCo
     return
 }
 
-func dial(spec string) (*net.TCPConn, error) {
-    host, port, err := net.SplitHostPort(spec)
-    if err != nil {
-        log.Infof("dial(): ERR: could not extract host and port from spec %v: %v", spec, err)
-        return nil, err
-    }
-    remoteAddr, err := net.ResolveIPAddr("ip", host)
-    if err != nil {
-        log.Infof("dial(): ERR: could not resolve %v: %v", host, err)
-        return nil, err
-    }
-    portInt, err := strconv.Atoi(port)
-    if err != nil {
-        log.Infof("dial(): ERR: could not convert network port from string \"%s\" to integer: %v", port, err)
-        return nil, err
-    }
-    remoteAddrAndPort := &net.TCPAddr{IP: remoteAddr.IP, Port: portInt}
-    var localAddr *net.TCPAddr
-    localAddr = nil
-    conn, err := net.DialTCP("tcp", localAddr, remoteAddrAndPort)
-    if err != nil {
-        log.Infof("dial(): ERR: could not connect to %v:%v: %v", remoteAddrAndPort.IP, remoteAddrAndPort.Port, err)
-    }
-    return conn, err
+func dial(spec proxySpec) (*net.TCPConn, error) {
+	remoteAddr, err := net.ResolveIPAddr("ip", spec.host)
+
+	if err != nil {
+		log.Infof("dial(): ERR: could not resolve %v: %v", spec.host, err)
+		return nil, err
+	}
+
+	var conn *net.TCPConn
+
+	remoteAddrAndPort := &net.TCPAddr{IP: remoteAddr.IP, Port: spec.port}
+	var localAddr *net.TCPAddr
+	localAddr = nil
+
+        conn, err = net.DialTCP("tcp", localAddr, remoteAddrAndPort)
+	if err != nil {
+		log.Infof("dial(): ERR: could not connect to %v:%v: %v", spec.host, spec.portString, err)
+	}
+
+	return conn, err
 }
 
 func handleDirectConnection(clientConn *net.TCPConn, ipv4 string, port uint16) {
@@ -551,8 +599,7 @@ func handleDirectConnection(clientConn *net.TCPConn, ipv4 string, port uint16) {
         return
     }
 
-    ipport := fmt.Sprintf("%s:%d", ipv4, port)
-    directConn, err := dial(ipport)
+    directConn, err := dial(proxySpec{host: ipv4, port: int(port), direct: true})
     if err != nil {
         clientConnRemoteAddr := "?"
         if clientConn != nil {
@@ -596,9 +643,11 @@ func handleProxyConnection(clientConn *net.TCPConn, ipv4 string, port uint16) {
         return
     }
 
-    host, _, err = net.SplitHostPort(remoteAddr.String())
-    if err == nil {
-        headerXFF = fmt.Sprintf("X-Forwarded-For: %s\r\n", host)
+    if gXFF != 0 {
+        host, _, err = net.SplitHostPort(remoteAddr.String())
+        if err == nil {
+            headerXFF = fmt.Sprintf("X-Forwarded-For: %s\r\n", host)
+        }
     }
 
     if gReverseLookups == 1 {
@@ -630,8 +679,8 @@ func handleProxyConnection(clientConn *net.TCPConn, ipv4 string, port uint16) {
 	    log.Debugf("SNI-PARSING|%v via %v for %v on destination %s:%d", clientConn.RemoteAddr(), proxyConn.RemoteAddr(), host, ipv4, port)
 	}
 	var authString = ""
-	if val, auth := gAuthProxyServers[proxySpec]; auth {
-	  authString = fmt.Sprintf("\r\nProxy-Authorization: Basic %s", val)
+	if proxySpec.auth != "" {
+	  authString = fmt.Sprintf("\r\nProxy-Authorization: Basic %s", proxySpec.auth)
 	}
         connectString := fmt.Sprintf("CONNECT %s:%d HTTP/1.0%s\r\n%s\r\n", connectHostname, port, authString, headerXFF)
         log.Debugf("PROXY|%v->%v->%s:%d|Sending to proxy: %s\n", clientConn.RemoteAddr(), proxyConn.RemoteAddr(), ipv4, port, strconv.Quote(connectString))
